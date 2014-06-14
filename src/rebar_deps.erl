@@ -40,6 +40,7 @@
 
 %% for internal use only
 -export([info/2]).
+-export([get_deps_dir/1]).
 
 -record(dep, { dir,
                app,
@@ -68,37 +69,57 @@ preprocess(Config, _) ->
     %% Add available deps to code path
     Config3 = update_deps_code_path(Config2, AvailableDeps),
 
-    %% If skip_deps=true, mark each dep dir as a skip_dir w/ the core so that
-    %% the current command doesn't run on the dep dir. However, pre/postprocess
-    %% WILL run (and we want it to) for transitivity purposes.
-    %%
-    %% Also, if skip_deps=comma,separated,app,list, then only the given
-    %% dependencies are skipped.
-    NewConfig = case rebar_config:get_global(Config3, skip_deps, false) of
-        "true" ->
-            lists:foldl(
-                fun(#dep{dir = Dir}, C) ->
-                        rebar_config:set_skip_dir(C, Dir)
-                end, Config3, AvailableDeps);
-        Apps when is_list(Apps) ->
-            SkipApps = [list_to_atom(App) || App <- string:tokens(Apps, ",")],
-            lists:foldl(
-                fun(#dep{dir = Dir, app = App}, C) ->
-                        case lists:member(App, SkipApps) of
-                            true -> rebar_config:set_skip_dir(C, Dir);
-                            false -> C
-                        end
-                end, Config3, AvailableDeps);
-        _ ->
-            Config3
-    end,
-
     %% Filtering out 'raw' dependencies so that no commands other than
     %% deps-related can be executed on their directories.
     NonRawAvailableDeps = [D || D <- AvailableDeps, not D#dep.is_raw],
 
-    %% Return all the available dep directories for process
-    {ok, NewConfig, dep_dirs(NonRawAvailableDeps)}.
+    case rebar_config:get_xconf(Config, current_command, undefined) of
+        'update-deps' ->
+            %% Skip ALL of the dep folders, we do this because we don't want
+            %% any other calls to preprocess() for update-deps beyond the
+            %% toplevel directory. They aren't actually harmful, but they slow
+            %% things down unnecessarily.
+            NewConfig = lists:foldl(
+                          fun(D, Acc) ->
+                                  rebar_config:set_skip_dir(Acc, D#dep.dir)
+                          end,
+                          Config3,
+                          collect_deps(rebar_utils:get_cwd(), Config3)),
+            %% Return the empty list, as we don't want anything processed before
+            %% us.
+            {ok, NewConfig, []};
+        _ ->
+            %% If skip_deps=true, mark each dep dir as a skip_dir w/ the core
+            %% so that the current command doesn't run on the dep dir.
+            %% However, pre/postprocess WILL run (and we want it to) for
+            %% transitivity purposes.
+            %%
+            %% Also, if skip_deps=comma,separated,app,list, then only the given
+            %% dependencies are skipped.
+            NewConfig =
+                case rebar_config:get_global(Config3, skip_deps, false) of
+                    "true" ->
+                        lists:foldl(
+                          fun(#dep{dir = Dir}, C) ->
+                                  rebar_config:set_skip_dir(C, Dir)
+                          end, Config3, AvailableDeps);
+                    Apps when is_list(Apps) ->
+                        SkipApps = [list_to_atom(App) ||
+                                       App <- string:tokens(Apps, ",")],
+                        lists:foldl(
+                          fun(#dep{dir = Dir, app = App}, C) ->
+                                  case lists:member(App, SkipApps) of
+                                      true -> rebar_config:set_skip_dir(C, Dir);
+                                      false -> C
+                                  end
+                          end, Config3, AvailableDeps);
+                    _ ->
+                        Config3
+                end,
+
+            %% Return all the available dep directories for process
+            {ok, NewConfig, dep_dirs(NonRawAvailableDeps)}
+    end.
 
 postprocess(Config, _) ->
     case rebar_config:get_xconf(Config, ?MODULE, undefined) of
@@ -169,17 +190,24 @@ do_check_deps(Config) ->
     {ok, save_dep_dirs(Config2, lists:reverse(PulledDeps))}.
 
 'update-deps'(Config, _) ->
-    %% Determine what deps are required
-    RawDeps = rebar_config:get_local(Config, deps, []),
-    {Config1, Deps} = find_deps(Config, read, RawDeps),
+    Config1 = rebar_config:set_xconf(Config, depowner, dict:new()),
+    {Config2, UpdatedDeps} = update_deps_int(Config1, []),
+    DepOwners = rebar_config:get_xconf(Config2, depowner, dict:new()),
 
-    %% Update each dep
-    UpdatedDeps = [update_source(Config1, D)
-                   || D <- Deps, D#dep.source =/= undefined],
+    %% check for conflicting deps
+    _ = [?ERROR("Conflicting dependencies for ~p: ~p~n",
+                [K, [{"From: " ++ string:join(dict:fetch(D, DepOwners), ", "),
+                      {D#dep.vsn_regex, D#dep.source}} || D <- V]])
+         || {K, V} <- dict:to_list(
+                        lists:foldl(
+                          fun(Dep, Acc) ->
+                                  dict:append(Dep#dep.app, Dep, Acc)
+                          end, dict:new(), UpdatedDeps)),
+            length(V) > 1],
 
     %% Add each updated dep to our list of dirs for post-processing. This yields
     %% the necessary transitivity of the deps
-    {ok, save_dep_dirs(Config1, UpdatedDeps)}.
+    {ok, save_dep_dirs(Config, UpdatedDeps)}.
 
 'delete-deps'(Config, _) ->
     %% Delete all the available deps in our deps/ directory, if any
@@ -230,13 +258,28 @@ info_help(Description) ->
        [
         Description,
         {deps_dir, "deps"},
-        {deps, [application_name,
-                {application_name, "1.0.*"},
-                {application_name, "1.0.*",
-                 {git, "git://github.com/rebar/rebar.git", {branch, "master"}}},
-                {application_name, "",
-                 {git, "git://github.com/rebar/rebar.git", {branch, "master"}},
-                 [raw]}]}
+        {deps,
+         [app_name,
+          {rebar, "1.0.*"},
+          {rebar, ".*",
+           {git, "git://github.com/rebar/rebar.git"}},
+          {rebar, ".*",
+           {git, "git://github.com/rebar/rebar.git", "Rev"}},
+          {rebar, "1.0.*",
+           {git, "git://github.com/rebar/rebar.git", {branch, "master"}}},
+          {rebar, "1.0.0",
+           {git, "git://github.com/rebar/rebar.git", {tag, "1.0.0"}}},
+          {rebar, "",
+           {git, "git://github.com/rebar/rebar.git", {branch, "master"}},
+           [raw]},
+          {app_name, ".*", {hg, "https://www.example.org/url"}},
+          {app_name, ".*", {rsync, "Url"}},
+          {app_name, ".*", {svn, "https://www.example.org/url"}},
+          {app_name, ".*", {svn, "svn://svn.example.org/url"}},
+          {app_name, ".*", {bzr, "https://www.example.org/url", "Rev"}},
+          {app_name, ".*", {fossil, "https://www.example.org/url"}},
+          {app_name, ".*", {fossil, "https://www.example.org/url", "Vsn"}},
+          {app_name, ".*", {p4, "//depot/subdir/app_dir"}}]}
        ]).
 
 %% Added because of trans deps,
@@ -263,7 +306,7 @@ get_deps_dir(Config) ->
     get_deps_dir(Config, "").
 
 get_deps_dir(Config, App) ->
-    BaseDir = rebar_config:get_xconf(Config, base_dir, []),
+    BaseDir = rebar_utils:base_dir(Config),
     DepsDir = get_shared_deps_dir(Config, "deps"),
     {true, filename:join([BaseDir, DepsDir, App])}.
 
@@ -419,7 +462,8 @@ is_app_available(Config, App, VsnRegex, Path, _IsRaw = false) ->
             {Config, {false, {missing_app_file, Path}}}
     end;
 is_app_available(Config, App, _VsnRegex, Path, _IsRaw = true) ->
-    ?DEBUG("is_app_available, looking for Raw Depencency ~p with Path ~p~n", [App, Path]),
+    ?DEBUG("is_app_available, looking for Raw Depencency ~p with Path ~p~n",
+           [App, Path]),
     case filelib:is_dir(Path) of
         true ->
             %% TODO: look for version string in <Path>/VERSION file? Not clear
@@ -442,8 +486,8 @@ use_source(Config, Dep, Count) ->
     case filelib:is_dir(Dep#dep.dir) of
         true ->
             %% Already downloaded -- verify the versioning matches the regex
-            case is_app_available(Config, Dep#dep.app,
-                                  Dep#dep.vsn_regex, Dep#dep.dir, Dep#dep.is_raw) of
+            case is_app_available(Config, Dep#dep.app, Dep#dep.vsn_regex,
+                                  Dep#dep.dir, Dep#dep.is_raw) of
                 {Config1, {true, _}} ->
                     Dir = filename:join(Dep#dep.dir, "ebin"),
                     ok = filelib:ensure_dir(filename:join(Dir, "dummy")),
@@ -465,6 +509,40 @@ use_source(Config, Dep, Count) ->
             use_source(Config, Dep#dep { dir = TargetDir }, Count-1)
     end.
 
+-record(p4_settings, {
+          client=undefined,
+          transport="tcp4:perforce:1666",
+          username,
+          password
+         }).
+init_p4_settings(Basename) ->
+    #p4_settings{client =
+                     case inet:gethostname() of
+                         {ok,HostName} ->
+                             HostName ++ "-"
+                                 ++ os:getenv("USER") ++ "-"
+                                 ++ Basename
+                                 ++ "-Rebar-automated-download"
+                     end}.
+
+download_source(AppDir, {p4, Url}) ->
+    download_source(AppDir, {p4, Url, "#head"});
+download_source(AppDir, {p4, Url, Rev}) ->
+    download_source(AppDir, {p4, Url, Rev, init_p4_settings(filename:basename(AppDir))});
+download_source(AppDir, {p4, Url, _Rev, Settings}) ->
+    ok = filelib:ensure_dir(AppDir),
+    rebar_utils:sh_send("p4 client -i",
+                   ?FMT("Client: ~s~n"
+                        ++"Description: generated by Rebar~n"
+                        ++"Root: ~s~n"
+                        ++"View:~n"
+                        ++"  ~s/...  //~s/...~n",
+                        [Settings#p4_settings.client,
+                         AppDir,
+                         Url,
+                         Settings#p4_settings.client]),
+                       []),
+    rebar_utils:sh(?FMT("p4 -c ~s sync -f", [Settings#p4_settings.client]), []);
 download_source(AppDir, {hg, Url, Rev}) ->
     ok = filelib:ensure_dir(AppDir),
     rebar_utils:sh(?FMT("hg clone -U ~s ~s", [Url, filename:basename(AppDir)]),
@@ -504,8 +582,6 @@ download_source(AppDir, {rsync, Url}) ->
     rebar_utils:sh(?FMT("rsync -az --delete ~s/ ~s", [Url, AppDir]), []);
 download_source(AppDir, {fossil, Url}) ->
     download_source(AppDir, {fossil, Url, ""});
-download_source(AppDir, {fossil, Url, latest}) ->
-    download_source(AppDir, {fossil, Url, ""});
 download_source(AppDir, {fossil, Url, Version}) ->
     Repository = filename:join(AppDir, filename:basename(AppDir) ++ ".fossil"),
     ok = filelib:ensure_dir(Repository),
@@ -533,6 +609,8 @@ update_source(Config, Dep) ->
             Dep
     end.
 
+update_source1(AppDir, Args) when element(1, Args) =:= p4 ->
+    download_source(AppDir, Args);
 update_source1(AppDir, {git, Url}) ->
     update_source1(AppDir, {git, Url, {branch, "HEAD"}});
 update_source1(AppDir, {git, Url, ""}) ->
@@ -540,10 +618,12 @@ update_source1(AppDir, {git, Url, ""}) ->
 update_source1(AppDir, {git, _Url, {branch, Branch}}) ->
     ShOpts = [{cd, AppDir}],
     rebar_utils:sh("git fetch origin", ShOpts),
-    rebar_utils:sh(?FMT("git checkout -q origin/~s", [Branch]), ShOpts);
+    rebar_utils:sh(?FMT("git checkout -q ~s", [Branch]), ShOpts),
+    rebar_utils:sh(
+      ?FMT("git pull --ff-only --no-rebase -q origin ~s", [Branch]),ShOpts);
 update_source1(AppDir, {git, _Url, {tag, Tag}}) ->
     ShOpts = [{cd, AppDir}],
-    rebar_utils:sh("git fetch --tags origin", ShOpts),
+    rebar_utils:sh("git fetch origin", ShOpts),
     rebar_utils:sh(?FMT("git checkout -q ~s", [Tag]), ShOpts);
 update_source1(AppDir, {git, _Url, Refspec}) ->
     ShOpts = [{cd, AppDir}],
@@ -559,12 +639,89 @@ update_source1(AppDir, {rsync, Url}) ->
     rebar_utils:sh(?FMT("rsync -az --delete ~s/ ~s",[Url,AppDir]),[]);
 update_source1(AppDir, {fossil, Url}) ->
     update_source1(AppDir, {fossil, Url, ""});
-update_source1(AppDir, {fossil, Url, latest}) ->
-    update_source1(AppDir, {fossil, Url, ""});
 update_source1(AppDir, {fossil, _Url, Version}) ->
     ok = file:set_cwd(AppDir),
     rebar_utils:sh("fossil pull", [{cd, AppDir}]),
     rebar_utils:sh(?FMT("fossil update ~s", [Version]), []).
+
+%% Recursively update deps, this is not done via rebar's usual dep traversal as
+%% that is the wrong order (tips are updated before branches). Instead we do a
+%% traverse the deps at each level completely before traversing *their* deps.
+%% This allows updates to actually propogate down the tree, rather than fail to
+%% flow up the tree, which was the previous behaviour.
+update_deps_int(Config0, UDD) ->
+    %% Determine what deps are required
+    ConfDir = filename:basename(rebar_utils:get_cwd()),
+    RawDeps = rebar_config:get_local(Config0, deps, []),
+    {Config1, Deps} = find_deps(Config0, read, RawDeps),
+
+    %% Update each dep
+    UpdatedDeps = [update_source(Config1, D)
+                   || D <- Deps, D#dep.source =/= undefined,
+                      not lists:member(D, UDD),
+                      not should_skip_update_dep(Config1, D)
+                  ],
+
+    lists:foldl(fun(Dep, {Config, Updated}) ->
+                        {true, AppDir} = get_deps_dir(Config, Dep#dep.app),
+                        Config2 = case has_vcs_dir(element(1, Dep#dep.source),
+                                                   AppDir) of
+                                      false ->
+                                          %% If the dep did not exist (maybe it
+                                          %% was added), clone it.
+                                          %% We'll traverse ITS deps below and
+                                          %% clone them if needed.
+                                          {C1, _D1} = use_source(Config, Dep),
+                                          C1;
+                                      true ->
+                                          Config
+                                  end,
+                        ok = file:set_cwd(AppDir),
+                        Config3 = rebar_config:new(Config2),
+                        %% track where a dep comes from...
+                        DepOwner = dict:append(
+                                     Dep, ConfDir,
+                                     rebar_config:get_xconf(Config3, depowner,
+                                                            dict:new())),
+                        Config4 = rebar_config:set_xconf(Config3, depowner,
+                                                         DepOwner),
+
+                        {Config5, Res} = update_deps_int(Config4, Updated),
+                        {Config5, lists:umerge(lists:sort(Res),
+                                               lists:sort(Updated))}
+                end, {Config1, lists:umerge(lists:sort(UpdatedDeps),
+                                            lists:sort(UDD))}, UpdatedDeps).
+
+should_skip_update_dep(Config, Dep) ->
+    {true, AppDir} = get_deps_dir(Config, Dep#dep.app),
+    case rebar_app_utils:is_app_dir(AppDir) of
+        false ->
+            false;
+        {true, AppFile} ->
+            case rebar_app_utils:is_skipped_app(Config, AppFile) of
+                {_Config, {true, _SkippedApp}} ->
+                    true;
+                _ ->
+                    false
+            end
+    end.
+
+%% Recursively walk the deps and build a list of them.
+collect_deps(Dir, C) ->
+    case file:set_cwd(Dir) of
+        ok ->
+            Config = rebar_config:new(C),
+            RawDeps = rebar_config:get_local(Config, deps, []),
+            {Config1, Deps} = find_deps(Config, read, RawDeps),
+
+            lists:flatten(Deps ++ [begin
+                                       {true, AppDir} = get_deps_dir(
+                                                          Config1, Dep#dep.app),
+                                       collect_deps(AppDir, C)
+                                   end || Dep <- Deps]);
+        _ ->
+            []
+    end.
 
 
 %% ===================================================================
@@ -577,7 +734,7 @@ source_engine_avail(Source) ->
 
 source_engine_avail(Name, Source)
   when Name == hg; Name == git; Name == svn; Name == bzr; Name == rsync;
-       Name == fossil ->
+       Name == fossil; Name == p4 ->
     case vcs_client_vsn(Name) >= required_vcs_client_vsn(Name) of
         true ->
             true;
@@ -598,6 +755,7 @@ vcs_client_vsn(Path, VsnArg, VsnRegex) ->
             false
     end.
 
+required_vcs_client_vsn(p4)     -> {2013, 1};
 required_vcs_client_vsn(hg)     -> {1, 1};
 required_vcs_client_vsn(git)    -> {1, 5};
 required_vcs_client_vsn(bzr)    -> {2, 0};
@@ -605,6 +763,9 @@ required_vcs_client_vsn(svn)    -> {1, 6};
 required_vcs_client_vsn(rsync)  -> {2, 0};
 required_vcs_client_vsn(fossil) -> {1, 0}.
 
+vcs_client_vsn(p4) ->
+    vcs_client_vsn(rebar_utils:find_executable("p4"), " -V",
+                   "Rev\\. .*/(\\d+)\\.(\\d)/");
 vcs_client_vsn(hg) ->
     vcs_client_vsn(rebar_utils:find_executable("hg"), " --version",
                    "version (\\d+).(\\d+)");
@@ -624,6 +785,8 @@ vcs_client_vsn(fossil) ->
     vcs_client_vsn(rebar_utils:find_executable("fossil"), " version",
                    "version (\\d+).(\\d+)").
 
+has_vcs_dir(p4, _) ->
+    true;
 has_vcs_dir(git, Dir) ->
     filelib:is_dir(filename:join(Dir, ".git"));
 has_vcs_dir(hg, Dir) ->
@@ -641,6 +804,8 @@ has_vcs_dir(_, _) ->
 print_source(#dep{app=App, source=Source}) ->
     ?CONSOLE("~s~n", [format_source(App, Source)]).
 
+format_source(App, {p4, Url}) ->
+    format_source(App, {p4, Url, "#head"});
 format_source(App, {git, Url}) ->
     ?FMT("~p BRANCH ~s ~s", [App, "HEAD", Url]);
 format_source(App, {git, Url, ""}) ->

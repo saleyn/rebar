@@ -51,7 +51,7 @@ xref(Config, _) ->
 
     xref:set_default(xref, [{warnings,
                              rebar_config:get(Config, xref_warnings, false)},
-                            {verbose, rebar_config:is_verbose(Config)}]),
+                            {verbose, rebar_log:is_verbose(Config)}]),
 
     {ok, _} = xref:add_directory(xref, "ebin"),
 
@@ -103,9 +103,11 @@ info(help, xref) ->
        "Valid rebar.config options:~n"
        "  ~p~n"
        "  ~p~n"
+       "  ~p~n"
        "  ~p~n",
        [
         {xref_warnings, false},
+        {xref_extra_paths,[]},
         {xref_checks, [undefined_function_calls, undefined_functions,
                        locals_not_used, exports_not_used,
                        deprecated_function_calls, deprecated_functions]},
@@ -144,8 +146,9 @@ code_path(Config) ->
     %% functions, even though those functions are present as part
     %% of compilation. H/t to @dluna. Long term we should tie more
     %% properly into the overall compile code path if possible.
-    BaseDir = rebar_config:get_xconf(Config, base_dir),
+    BaseDir = rebar_utils:base_dir(Config),
     [P || P <- code:get_path() ++
+              rebar_config:get(Config, xref_extra_paths, []) ++
               [filename:join(BaseDir, filename:join(SubDir, "ebin"))
                || SubDir <- rebar_config:get(Config, sub_dirs, [])],
           filelib:is_dir(P)].

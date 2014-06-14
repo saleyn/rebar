@@ -3,7 +3,7 @@
 
 {application, rebar,
  [{description, "Rebar: Erlang Build Tool"},
-  {vsn, "2.1.0-pre"},
+  {vsn, "2.3.1"},
   {modules, [ rebar,
               rebar_abnfc_compiler,
               rebar_app_utils,
@@ -38,8 +38,9 @@
               rebar_upgrade,
               rebar_utils,
               rebar_xref,
-              getopt,
-              mustache ]},
+              rebar_metacmds,
+              rebar_getopt,
+              rebar_mustache ]},
   {registered, []},
   {applications, [kernel,
                   stdlib,
@@ -50,7 +51,7 @@
                   tools]},
   {env, [
          %% Default log level
-         {log_level, error},
+         {log_level, warn},
 
          %% any_dir processing modules
          {any_dir_modules, [
@@ -80,7 +81,8 @@
                                rebar_escripter,
                                rebar_edoc,
                                rebar_shell,
-                               rebar_xref
+                               rebar_xref,
+                               rebar_metacmds
                               ]},
 
                     {rel_dir, [
@@ -88,6 +90,14 @@
                                rebar_reltool,
                                rebar_upgrade
                               ]}
-                   ]}
+                   ]},
+         {recursive_cmds, [
+                           'check-deps',
+                           compile,
+                           'delete-deps',
+                           'get-deps',
+                           'list-deps',
+                           'update-deps'
+                          ]}
         ]}
  ]}.

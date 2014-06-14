@@ -87,7 +87,8 @@ info(help, 'generate-upgrade') ->
     ?CONSOLE("Build an upgrade package.~n"
              "~n"
              "Valid command line options:~n"
-             "  previous_release=path~n",
+             "  previous_release=path~n"
+             "  target_dir=target_dir (optional)~n",
              []).
 
 run_checks(Config, OldVerPath, ReltoolConfig) ->
@@ -97,10 +98,7 @@ run_checks(Config, OldVerPath, ReltoolConfig) ->
 
     {Name, Ver} = rebar_rel_utils:get_reltool_release_info(ReltoolConfig),
 
-    NewVerPath =
-        filename:join(
-          [rebar_rel_utils:get_target_parent_dir(Config, ReltoolConfig),
-           Name]),
+    NewVerPath = rebar_rel_utils:get_target_dir(Config, ReltoolConfig),
     true = rebar_utils:prop_check(filelib:is_dir(NewVerPath),
                                   "Release directory doesn't exist (~p)~n",
                                   [NewVerPath]),
@@ -184,13 +182,24 @@ boot_files(TargetDir, Ver, Name) ->
           filename:join([TargetDir, "releases", Ver, "start_clean.boot"]),
           filename:join([".", ?TMP, "releases", Ver, "start_clean.boot"])),
 
-    {ok, _} = file:copy(
-                filename:join([TargetDir, "releases", Ver, "sys.config"]),
-                filename:join([".", ?TMP, "releases", Ver, "sys.config"])),
+    SysConfig = filename:join([TargetDir, "releases", Ver, "sys.config"]),
+    _ = case filelib:is_regular(SysConfig) of
+            true ->
+                {ok, _} = file:copy(
+                            SysConfig,
+                            filename:join([".", ?TMP, "releases", Ver,
+                                           "sys.config"]));
+            false -> ok
+        end,
 
-    {ok, _} = file:copy(
-                filename:join([TargetDir, "releases", Ver, "vm.args"]),
-                filename:join([".", ?TMP, "releases", Ver, "vm.args"])).
+    VmArgs = filename:join([TargetDir, "releases", Ver, "vm.args"]),
+    case filelib:is_regular(VmArgs) of
+        true ->
+            {ok, _} = file:copy(
+                        VmArgs,
+                        filename:join([".", ?TMP, "releases", Ver, "vm.args"]));
+        false -> {ok, 0}
+    end.
 
 make_tar(NameVer, NewVer, NewName) ->
     Filename = NameVer ++ ".tar.gz",
