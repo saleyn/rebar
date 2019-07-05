@@ -240,7 +240,8 @@ compile_each(_Config, [], _Type, _Env, {NewBins, CDB}) ->
     {lists:reverse(NewBins), lists:reverse(CDB)};
 compile_each(Config, [Source | Rest], Type, Env, {NewBins, CDB}) ->
     Ext = filename:extension(Source),
-    Bin = replace_extension(Source, Ext, ".o"),
+    ArchExt = obj_ext(),
+    Bin = replace_extension(Source, Ext, ArchExt),
     Template = select_compile_template(Type, compiler(Ext)),
     Cmd = expand_command(Template, Env, Source, Bin),
     CDBEnt = cdb_entry(Source, Cmd, Rest),
@@ -412,7 +413,8 @@ port_sources(Sources) ->
     lists:flatmap(fun filelib:wildcard/1, Sources).
 
 port_objects(SourceFiles) ->
-    [replace_extension(O, ".o") || O <- SourceFiles].
+    Ext = obj_ext(),
+    [replace_extension(O, Ext) || O <- SourceFiles].
 
 port_deps(SourceFiles) ->
     [replace_extension(O, ".d") || O <- SourceFiles].
@@ -435,6 +437,12 @@ switch_to_dll_or_exe(Target) ->
         ".so"  -> filename:rootname(Target, ".so") ++ ".dll";
         []     -> Target ++ ".exe";
         _Other -> Target
+    end.
+
+obj_ext() ->
+    case os:type() of
+        {win32,_} -> ".obj";
+        _         -> ".o"
     end.
 
 %%
